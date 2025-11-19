@@ -1,14 +1,10 @@
-User-agent: Googlebot
-Allow: /
-
-User-agent: Bingbot
-Allow: /
-
-User-agent: Twitterbot
-Allow: /
-
-User-agent: facebookexternalhit
-Allow: /
-
+# robots.txt for Safrochain Testnet Faucet
 User-agent: *
 Allow: /
+
+# Sitemap
+Sitemap: https://faucet.safrochain.com/sitemap.xml
+
+# Disallow admin or API paths if any
+Disallow: /api/
+Disallow: /admin/

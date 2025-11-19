@@ -1,10 +1,9 @@
-
 import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Wallet, ArrowRight, Copy, Check, RefreshCw } from 'lucide-react';
+import { Wallet, ArrowRight, Copy, Check, RefreshCw, Sparkles } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { supabase } from '@/integrations/supabase/client';
+import { getRequestsLimit, sendTransaction } from '@/services/api';
 
 interface FaucetFormProps {
   tokenAmount?: number;
@@ -21,19 +20,8 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
   useEffect(() => {
     const fetchRequestsLimit = async () => {
       try {
-        const { data, error } = await supabase
-          .from('safro_faucet_config')
-          .select('requests_limit_per_day')
-          .single();
-        
-        if (error) {
-          console.error('Error fetching requests limit:', error);
-          return; // Keep default value
-        }
-        
-        if (data?.requests_limit_per_day) {
-          setRequestsLimit(data.requests_limit_per_day);
-        }
+        const limit = await getRequestsLimit();
+        setRequestsLimit(limit);
       } catch (error) {
         console.error('Error fetching requests limit:', error);
         // Keep default value
@@ -58,49 +46,22 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
     }
 
     try {
-      const response = await supabase.functions.invoke('safro-transaction', {
-        body: { receiver: address }
-      });
+      const rawTxResult = await sendTransaction(address);
 
-      const { data: rawTxResult, error } = response;
-
-      // Check for any rate limit indicators first
-      const isRateLimit = isRateLimitError(error) || 
-                         isRateLimitError(rawTxResult) ||
-                         (error as any)?.name === 'FunctionsHttpError' ||
-                         (error as any)?.status === 429;
-
-      if (isRateLimit) {
-        showRateLimitInfo(`You have reached the ${requestsLimit} requests per day limit. Please wait until tomorrow to request more test tokens.`, (rawTxResult as any)?.rateLimitType);
-        return;
-      }
-
-      // For any other error, show generic friendly message
-      if (error) {
-        console.error("safro-transaction invoke error:", error);
+      if (!rawTxResult || !rawTxResult.transactionHash) {
+        const errMsg =
+          rawTxResult.error ||
+          "No transaction hash returned from faucet. Please try again.";
+        console.error("Transaction unexpected response:", rawTxResult);
         toast({
-          title: "Request Failed",
-          description: "Unable to process your request at the moment. Please try again later.",
+          title: "Transaction error",
+          description: (
+            <div className="max-w-[340px] break-words">{String(errMsg)}</div>
+          ),
           variant: "destructive",
         });
         return;
       }
-
-        if (!rawTxResult || !rawTxResult.transactionHash) {
-          // If function responded but without tx hash, display the returned error (if any)
-          const errMsg =
-            (rawTxResult as any)?.error ||
-            "No transaction hash returned from faucet. Please try again.";
-          console.error("safro-transaction unexpected response:", rawTxResult);
-          toast({
-            title: "Transaction error",
-            description: (
-              <div className="max-w-[340px] break-words">{String(errMsg)}</div>
-            ),
-            variant: "destructive",
-          });
-          return;
-        }
 
       const txData = {
         transactionHash: rawTxResult.transactionHash,
@@ -109,7 +70,7 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
         amount: rawTxResult.amount || { denom: tokenSymbol.toLowerCase(), amount: String(tokenAmount) },
         senderAddress: rawTxResult.senderAddress,
         receiverAddress: rawTxResult.receiverAddress || address,
-        memo: rawTxResult.memo || 'Sending tokens with CosmJS',
+        memo: rawTxResult.memo || 'Sending tokens with safrochain faucet',
         senderBalance: rawTxResult.senderBalance,
         receiverBalance: rawTxResult.receiverBalance,
         gasUsed: rawTxResult.gasUsed?.toString(),
@@ -117,32 +78,35 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
       };
 
       toast({
-        title: "Success!",
+        title: "Success! 🎉",
         description: (
           <a 
-            href={rawTxResult.explorerTxUrl || `https://rpcsafro.cardanotask.com/tx?hash=0x${txData.transactionHash}`}
+            href={rawTxResult.explorerTxUrl || `https://explorer.testnet.safrochain.com/safrochain/tx/${txData.transactionHash}`}
             target="_blank" 
             rel="noreferrer"
-            className="text-blue-400 underline hover:text-blue-200"
+            className="text-blue-400 underline hover:text-blue-300 transition-colors inline-flex items-center gap-1"
           >
             View transaction on Safrochain Explorer
+            <ArrowRight className="h-3 w-3 inline" />
           </a>
         ),
       });
-    } catch (error) {
+      
+      // Clear form on success
+      setAddress('');
+    } catch (error: any) {
       console.error("Transaction error:", error);
       
-      // Check if this is a rate limit error using existing detection logic
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const isRateLimit = (error as any)?.name === 'FunctionsHttpError' || 
-                         (error as any)?.status === 429 ||
-                         isRateLimitErrorMessage(errorMessage);
+      const isRateLimit = error.rateLimitType || 
+                         error.status === 429 ||
+                         (error.error && isRateLimitErrorMessage(error.error));
       
       if (isRateLimit) {
-        // Show friendly rate limit message with dynamic limit
-        showRateLimitInfo(`You have reached the ${requestsLimit} requests per day limit. Please wait until tomorrow to request more test tokens.`);
+        showRateLimitInfo(
+          `You have reached the ${requestsLimit} requests per day limit. Please wait until tomorrow to request more test tokens.`,
+          error.rateLimitType
+        );
       } else {
-        // For other errors, show generic friendly message without technical details
         toast({
           title: "Request Failed",
           description: "Unable to process your request at the moment. Please try again later.",
@@ -153,17 +117,6 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
     } finally {
       setIsLoading(false);
     }
-  };
-
-  const isRateLimitError = (obj: any): boolean => {
-    if (!obj) return false;
-    if (obj.code === '429' || obj.status === 429 || obj.statusCode === 429) return true;
-    if (obj.message && isRateLimitErrorMessage(obj.message)) return true;
-    if (obj.error) {
-      const errorStr = String(obj.error);
-      if (isRateLimitErrorMessage(errorStr)) return true;
-    }
-    return false;
   };
 
   const isRateLimitErrorMessage = (message: string): boolean => {
@@ -182,7 +135,6 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
     let description = "You've successfully used all your faucet requests for today! 🎉";
     let additionalInfo = "Come back in 24 hours for more test tokens.";
     
-    // Add specific guidance based on rate limit type
     if (rateLimitType === "ip") {
       description = "Your network has reached today's faucet limit.";
       additionalInfo = "Try from a different network or wait 24 hours to request more tokens.";
@@ -193,7 +145,6 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
       description = "Both your network and wallet have reached today's limit.";
       additionalInfo = "Please wait 24 hours before requesting more test tokens.";
     } else if (!rateLimitType) {
-      // Generic case when we don't have specific rate limit type info
       description = "You have reached your daily faucet limit.";
       additionalInfo = "You can request more tokens in 24 hours. Try using a different network or wallet if needed.";
     }
@@ -224,7 +175,9 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
 
   const CopyButton = ({ textToCopy }: { textToCopy: string }) => {
     const [isCopied, setIsCopied] = useState(false);
-    const handleCopy = () => {
+    const handleCopy = (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
       navigator.clipboard.writeText(textToCopy);
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 1500);
@@ -234,14 +187,15 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
         variant="ghost" 
         size="sm" 
         onClick={handleCopy} 
-        className="hover:bg-transparent p-1"
+        className="hover:bg-blue-500/10 p-1.5 sm:p-1 min-w-[32px] min-h-[32px] touch-manipulation transition-colors"
         tabIndex={-1}
         aria-label="Copy address"
+        type="button"
       >
         {isCopied ? (
-          <Check className="h-4 w-4 text-green-500" />
+          <Check className="h-4 w-4 text-green-500 transition-all" />
         ) : (
-          <Copy className="h-4 w-4 hover:text-blue-500" />
+          <Copy className="h-4 w-4 text-slate-400 hover:text-blue-400 active:text-blue-500 transition-colors" />
         )}
       </Button>
     );
@@ -250,88 +204,135 @@ const FaucetForm = ({ tokenAmount = 250, tokenSymbol = "SAF" }: FaucetFormProps)
   return (
     <form 
       onSubmit={handleSubmit} 
-      className="w-[98vw] sm:w-[90vw] md:w-[70vw] max-w-5xl mx-auto
-                 min-w-0
-                 lg:max-w-5xl
+      className="w-full max-w-3xl mx-auto
                  rounded-2xl border border-white/10 
-                 bg-white/60 dark:bg-[#191c2a]/80
-                 shadow-[0_8px_32px_0_rgba(31,38,135,0.19)]
-                 glass-morphism
-                 backdrop-blur-xl 
+                 bg-white/80 dark:bg-slate-800/80
+                 backdrop-blur-xl
+                 shadow-2xl
                  overflow-hidden 
-                 flex flex-col md:flex-row items-center md:items-stretch justify-center gap-0
-                 min-h-[350px] md:min-h-[340px] max-h-[620px]
-                 transition-all duration-300
-                 relative
-                 mx-auto"
-      style={{
-        aspectRatio: '2.4/1',
-        boxShadow: '0 8px 56px 0 rgba(78,58,122,0.14), 0 2px 24px 2px rgba(62,20,95,0.13)',
-        background: 'linear-gradient(90deg,#ede9fc 0%, #f6f8fd 51%, #e3e4fb 100%)',
-      }}
+                 transition-all duration-300 hover:shadow-blue-500/20
+                 relative"
     >
-      {/* Left: Form Fields */}
-      <div className="flex flex-col flex-1 justify-center items-center md:items-start px-6 sm:px-10 py-8 gap-4 lg:gap-6 w-full">
-        {/* Header */}
-        <h2 className="text-2xl md:text-2xl font-bold text-[#452b87] dark:text-white bg-gradient-to-r from-[#6c3edb] via-[#a1a7f8] to-[#fbafe3] bg-clip-text text-transparent tracking-tight mb-2 w-full text-center md:text-left">
-          Request Safrochain Test Tokens
-        </h2>
-        {/* Input */}
-        <label htmlFor="safro-address" className="block w-full text-[14px] md:text-base font-medium mb-1 text-gray-800/80 dark:text-gray-200/80 text-left">
-          Safrochain Address
-        </label>
-        <div className="relative flex items-center w-full">
-          <Wallet className="absolute left-3 top-1/2 -translate-y-1/2 h-[20px] w-[20px] text-indigo-400 dark:text-indigo-300" />
-          <Input
-            id="safro-address"
-            type="text"
-            placeholder="e.g. addr_safro1xyz..."
-            value={address}
-            onChange={(e) => setAddress(e.target.value)}
-            className="pl-11 pr-12 h-12 md:h-11 text-base text-gray-800 dark:text-white bg-white/70 dark:bg-black/10 border border-indigo-100 dark:border-indigo-700 shadow rounded-lg
-              focus:border-indigo-300 dark:focus:border-indigo-400 transition-all"
-            required
-            maxLength={90}
-            autoFocus
-            style={{ minWidth: 0 }}
-          />
-          {address && <span className="absolute right-2"><CopyButton textToCopy={address} /></span>}
-        </div>
-        {/* Helper */}
-        <span className="mt-1 text-xs md:text-sm leading-tight text-gray-400 dark:text-gray-400/60 w-full text-center md:text-left">
-          Please use an address starting with <b>addr_safro</b>. Limit: {requestsLimit} requests per 24h per IP and per wallet.
-        </span>
-      </div>
+      {/* Subtle gradient overlay */}
+      <div className="absolute inset-0 bg-gradient-to-br from-white/50 via-blue-50/30 to-cyan-50/50 dark:from-slate-900/50 dark:via-blue-900/20 dark:to-cyan-900/30 pointer-events-none" />
+      
+      <div className="relative z-10 flex flex-col md:flex-row items-stretch gap-0">
+        {/* Left: Form Fields */}
+        <div className="flex flex-col flex-1 justify-center px-6 sm:px-8 md:px-10 py-8 sm:py-10 gap-5 sm:gap-6 w-full md:border-r md:border-slate-200/50 dark:md:border-slate-700/50">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 mb-2">
+              <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">
+                Request Test Tokens
+              </h2>
+            </div>
+            <p className="text-sm text-slate-600 dark:text-slate-400 hidden sm:block">
+              Enter your Safrochain address to receive test tokens
+            </p>
+          </div>
 
-      {/* Right: Action & Amount */}
-      <div className="flex flex-row md:flex-col justify-center md:justify-between items-center md:items-end flex-shrink-0 border-t md:border-t-0 md:border-l border-white/20 px-5 sm:px-7 py-5 sm:py-8 gap-4 bg-gradient-to-b from-white/70 via-white/40 to-purple-50 dark:from-[#222238]/80 dark:via-[#221f35]/70 dark:to-transparent
-        w-full md:w-auto"
-        style={{ minWidth: '220px' }}>
-        <div className="flex items-center gap-2 mb-0 md:mb-4 mt-0 md:mt-1">
-          <span className="rounded-lg px-4 py-1.5 text-base bg-[#ece5fc] dark:bg-[#34246b] text-[#6c3edb] dark:text-indigo-200 font-semibold border border-[#ddcef9] dark:border-[#47307c]">
-            {tokenAmount} {tokenSymbol}
-          </span>
+          {/* Input */}
+          <div className="space-y-2">
+            <label htmlFor="safro-address" className="block text-sm font-medium text-slate-700 dark:text-slate-300">
+              Safrochain Address
+            </label>
+            <div className="relative">
+              <Wallet className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-blue-500 z-10 pointer-events-none" />
+              <Input
+                id="safro-address"
+                type="text"
+                placeholder="addr_safro1..."
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                className="pl-11 pr-11 h-12 md:h-12 text-base text-slate-900 dark:text-slate-100 
+                  bg-white dark:bg-slate-900/50 
+                  border border-slate-200 dark:border-slate-700 
+                  shadow-sm
+                  rounded-xl
+                  focus:border-blue-500 dark:focus:border-blue-400 
+                  focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20
+                  transition-all duration-200 touch-manipulation
+                  placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                required
+                maxLength={90}
+                autoFocus={typeof window !== 'undefined' && window.innerWidth > 768}
+                disabled={isLoading}
+              />
+              {address && (
+                <div className="absolute right-2 top-1/2 -translate-y-1/2">
+                  <CopyButton textToCopy={address} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Helper text */}
+          <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+            Address must start with <span className="font-semibold text-blue-600 dark:text-blue-400">addr_safro</span>
+            <span className="hidden sm:inline"> • Limit: {requestsLimit} requests per 24h per IP and wallet</span>
+            <span className="sm:hidden"> • {requestsLimit}/day limit</span>
+          </p>
         </div>
-        <Button
-          type="submit"
-          className="w-full md:w-auto px-8 py-3 text-base rounded-xl font-semibold flex items-center justify-center gap-3
-            bg-gradient-to-r from-[#8e7ced] via-[#aea7e6] to-[#fee1fa]
-            hover:from-[#7c66b3] hover:to-[#e9cef8] shadow-xl transition-all duration-200"
-          disabled={isLoading}
-          style={{ minWidth: 0 }}
-        >
-          {isLoading ? (
-            <span className="flex items-center text-base">
-              <RefreshCw className="mr-2 h-5 w-5 animate-spin" />
-              Processing...
-            </span>
-          ) : (
-            <>
-              <ArrowRight className="mr-2 h-5 w-5" />
-              Request Tokens
-            </>
-          )}
-        </Button>
+
+        {/* Right: Action & Amount */}
+        <div className="flex flex-row md:flex-col justify-between items-center md:items-end 
+          flex-shrink-0 
+          border-t md:border-t-0 md:border-l border-slate-200/50 dark:border-slate-700/50
+          px-6 sm:px-8 md:px-8 lg:px-10 
+          py-6 sm:py-8 
+          gap-4 sm:gap-5
+          bg-gradient-to-r md:bg-gradient-to-b from-slate-50/50 to-white/50 dark:from-slate-800/50 dark:to-slate-900/50
+          w-full md:w-auto md:min-w-[240px] lg:min-w-[260px]">
+          
+          {/* Token amount badge */}
+          <div className="hidden md:flex items-center gap-2 md:mb-5 order-1 md:order-none">
+            <div className="flex flex-col items-center sm:items-start gap-1">
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">You'll receive</span>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-2xl sm:text-3xl font-bold bg-gradient-to-r from-blue-600 to-cyan-600 dark:from-blue-400 dark:to-cyan-400 text-transparent bg-clip-text">
+                  {tokenAmount}
+                </span>
+                <span className="text-lg sm:text-xl font-semibold text-slate-700 dark:text-slate-300">
+                  {tokenSymbol}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Submit button */}
+          <Button
+            type="submit"
+            className="w-full sm:w-auto md:w-full px-8 sm:px-10 py-3 sm:py-3.5 text-base rounded-xl font-semibold 
+              flex items-center justify-center gap-2
+              bg-gradient-to-r from-blue-600 to-cyan-600 
+              hover:from-blue-700 hover:to-cyan-700
+              dark:from-blue-500 dark:to-cyan-500
+              dark:hover:from-blue-600 dark:hover:to-cyan-600
+              text-white
+              shadow-lg shadow-blue-500/25
+              hover:shadow-xl hover:shadow-blue-500/30
+              transition-all duration-200
+              min-w-[160px] sm:min-w-[180px] md:min-w-0
+              flex-1 sm:flex-none md:flex-initial
+              touch-manipulation
+              order-2 md:order-none
+              disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-lg"
+            disabled={isLoading || !address}
+          >
+            {isLoading ? (
+              <>
+                <RefreshCw className="h-5 w-5 animate-spin" />
+                <span className="hidden sm:inline">Processing...</span>
+                <span className="sm:hidden">Processing</span>
+              </>
+            ) : (
+              <>
+                <span className="hidden sm:inline">Request Tokens</span>
+                <span className="sm:hidden">Request</span>
+                <ArrowRight className="h-5 w-5" />
+              </>
+            )}
+          </Button>
+        </div>
       </div>
     </form>
   );
