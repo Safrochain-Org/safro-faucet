@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => ({
   },
   preview: {
     host: "0.0.0.0",
-    port: 4173,
+    port: parseInt(process.env.VITE_PREVIEW_PORT || process.env.VITE_PORT || "4173", 10),
     strictPort: true,
     allowedHosts: ["faucet.safrochain.com", "faucet.cardanotask.com"],
   },
