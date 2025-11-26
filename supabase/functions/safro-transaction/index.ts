@@ -120,6 +120,9 @@ async function fetchRegion(ip: string): Promise<string | null> {
 
 async function sendTokens(receiverAddress: string) {
   console.log("Starting transaction process...");
+  // Note: This function handles sequence numbers properly to prevent sequence mismatch errors.
+  // Since Supabase functions are stateless, we can't maintain an in-memory queue,
+  // but proper sequence handling and retries should prevent most conflicts.
   // Fetch config dynamically
   const config = await fetchFaucetConfig();
   const {
@@ -167,24 +170,106 @@ async function sendTokens(receiverAddress: string) {
     });
     const [senderAccount] = await wallet.getAccounts();
     const senderAddress = senderAccount.address;
-    const client = await SigningStargateClient.connectWithSigner(rpcEndpointWithProtocol, wallet);
-
-    const chainId = await client.getChainId();
-    const senderBalance = await client.getAllBalances(senderAddress);
     
-    // Increase the fee amount from 500 to 5000 based on error message
+    // Fee configuration
     const fee = {
       amount: [{ denom: DENOM, amount: "5000" }],
       gas: "200000",
     };
 
-    let retries = 3;
+    // Helper function to wait for sequence to stabilize
+    async function waitForSequenceStable(client: any, address: string, expectedSequence: number, maxWaitMs: number = 10000): Promise<number> {
+      const startTime = Date.now();
+      let lastSequence = expectedSequence;
+      let stableCount = 0;
+      const requiredStableChecks = 5; // Sequence must be stable for 5 consecutive checks (increased from 3)
+      
+      while (Date.now() - startTime < maxWaitMs) {
+        const account = await client.getAccount(address);
+        const currentSequence = account ? account.sequence : 0;
+        
+        if (currentSequence === lastSequence) {
+          stableCount++;
+          if (stableCount >= requiredStableChecks) {
+            console.log(`Sequence stabilized at ${currentSequence} after ${stableCount} checks`);
+            // One final check right before returning
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            const finalAccount = await client.getAccount(address);
+            const finalSequence = finalAccount ? finalAccount.sequence : 0;
+            if (finalSequence !== currentSequence) {
+              console.log(`Sequence changed during final check: ${currentSequence} -> ${finalSequence}, restarting`);
+              lastSequence = finalSequence;
+              stableCount = 1;
+              continue;
+            }
+            return finalSequence;
+          }
+        } else {
+          console.log(`Sequence changed: ${lastSequence} -> ${currentSequence}, resetting stability check`);
+          lastSequence = currentSequence;
+          stableCount = 1;
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 800)); // Increased from 500ms
+      }
+      
+      console.log(`Sequence check timeout, using last known sequence: ${lastSequence}`);
+      return lastSequence;
+    }
+
+    // Helper function to wait for transaction to be included and sequence to update
+    async function waitForSequenceUpdate(client: any, address: string, previousSequence: number, maxWaitMs: number = 10000): Promise<number> {
+      const startTime = Date.now();
+      const targetSequence = previousSequence + 1;
+      
+      while (Date.now() - startTime < maxWaitMs) {
+        const account = await client.getAccount(address);
+        const currentSequence = account ? account.sequence : 0;
+        
+        if (currentSequence >= targetSequence) {
+          console.log(`Sequence updated: ${previousSequence} -> ${currentSequence}`);
+          return currentSequence;
+        }
+        
+        console.log(`Waiting for sequence update... current: ${currentSequence}, expected: ${targetSequence}`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      // Final check
+      const account = await client.getAccount(address);
+      const finalSequence = account ? account.sequence : 0;
+      console.log(`Sequence update check completed. Final sequence: ${finalSequence}`);
+      return finalSequence;
+    }
+
+    // Retry logic with sequence number handling
+    // Create a fresh client for each retry to avoid sequence caching issues
+    let retries = 5;
     let result;
     let txError;
+    
     while (retries > 0) {
+      // Create a fresh client for each attempt to avoid sequence caching
+      const freshClient = await SigningStargateClient.connectWithSigner(rpcEndpointWithProtocol, wallet);
+      
       try {
-        console.log(`Attempt ${4 - retries}/3: Sending transaction...`);
-        result = await client.signAndBroadcast(
+        // Wait for sequence to stabilize before sending transaction
+        // This ensures we're using the most up-to-date sequence
+        console.log("Waiting for sequence to stabilize...");
+        const stableSequence = await waitForSequenceStable(freshClient, senderAddress, 0, 10000);
+        console.log(`Using stable sequence: ${stableSequence} for transaction`);
+        
+        // Final sequence check right before signing
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        const finalCheck = await freshClient.getAccount(senderAddress);
+        const finalSequence = finalCheck ? finalCheck.sequence : 0;
+        if (finalSequence !== stableSequence) {
+          throw new Error(`Sequence changed right before signing: expected ${stableSequence}, got ${finalSequence}. Retrying...`);
+        }
+        
+        console.log(`Attempt ${6 - retries}/5: Sending transaction with sequence ${finalSequence}...`);
+        
+        result = await freshClient.signAndBroadcast(
           senderAddress,
           [
             {
@@ -204,7 +289,13 @@ async function sendTokens(receiverAddress: string) {
         console.log("Transaction hash:", result.transactionHash);
         console.log("Block height:", result.height);
 
-        const receiverBalance = await client.getAllBalances(receiverAddress);
+        // Wait for the transaction to be included and sequence to update
+        console.log("Waiting for transaction to be included and sequence to update...");
+        await waitForSequenceUpdate(freshClient, senderAddress, finalSequence, 15000); // Increased timeout
+
+        const chainId = await freshClient.getChainId();
+        const senderBalance = await freshClient.getAllBalances(senderAddress);
+        const receiverBalance = await freshClient.getAllBalances(receiverAddress);
         const processedResult = {
           success: true,
           transactionHash: result.transactionHash,
@@ -223,12 +314,29 @@ async function sendTokens(receiverAddress: string) {
 
         return processedResult;
       } catch (error) {
-        console.error("Transaction error:", error.message);
+        const errorMessage = error.message || String(error);
+        console.error("Transaction error:", errorMessage);
         console.error("Raw transaction error response:", error.response || error);
+        
+        // Check if it's a sequence mismatch error
+        const isSequenceError = errorMessage.includes('sequence') || 
+                                errorMessage.includes('account sequence mismatch') ||
+                                errorMessage.includes('incorrect account sequence');
+        
+        if (isSequenceError) {
+          console.log("Sequence mismatch detected, waiting longer and will retry with fresh client...");
+          // Wait longer for sequence errors to allow the chain to update
+          // Also wait for sequence to stabilize
+          await new Promise(resolve => setTimeout(resolve, 5000)); // Increased from 3000ms
+        } else {
+          // For other errors, wait a shorter time
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
         txError = error;
         retries -= 1;
         if (retries > 0) {
-          console.log(`Retrying transaction... (${3 - retries}/3)`);
+          console.log(`Retrying transaction... (${5 - retries}/5)`);
         }
       }
     }
