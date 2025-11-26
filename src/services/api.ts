@@ -67,11 +67,23 @@ export async function getRequestsLimit(): Promise<number> {
 
 // Send transaction
 export async function sendTransaction(receiver: string): Promise<TransactionResponse> {
+    // Get API key from environment variable (set at build time)
+    // This is a secret that only the frontend knows
+    const apiKey = import.meta.env.VITE_API_KEY || import.meta.env.VITE_FRONTEND_API_KEY;
+    
+    const headers: HeadersInit = {
+        'Content-Type': 'application/json',
+    };
+    
+    // Add API key header if configured
+    if (apiKey) {
+        headers['X-API-Key'] = apiKey;
+    }
+    
     const response = await fetch(`${API_BASE_URL}/api/transaction`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
+        headers,
+        credentials: 'include', // Include cookies for CORS
         body: JSON.stringify({ receiver }),
     });
 
