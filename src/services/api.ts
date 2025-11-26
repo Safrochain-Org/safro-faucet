@@ -70,16 +70,30 @@ export async function sendTransaction(receiver: string): Promise<TransactionResp
     // Get API key from environment variable (set at build time)
     // This is a secret that only the frontend knows
     const apiKey = import.meta.env.VITE_API_KEY || import.meta.env.VITE_FRONTEND_API_KEY;
-    
+
     const headers: HeadersInit = {
         'Content-Type': 'application/json',
     };
-    
+
     // Add API key header if configured
     if (apiKey) {
         headers['X-API-Key'] = apiKey;
+        // Debug logging in development
+        if (import.meta.env.DEV) {
+            console.log('[API] API key found, sending request with X-API-Key header');
+            console.log('[API] API key length:', apiKey.length);
+            console.log('[API] API key preview:', apiKey.substring(0, 8) + '...');
+        }
+    } else {
+        // Log warning in development
+        if (import.meta.env.DEV) {
+            console.error('[API] ❌ VITE_API_KEY or VITE_FRONTEND_API_KEY not set!');
+            console.error('[API] Available env vars:', Object.keys(import.meta.env).filter(k => k.startsWith('VITE_')));
+            console.error('[API] Create a .env file in safro-faucet/ with: VITE_API_KEY=your-api-key-here');
+            console.error('[API] Then restart the dev server (Vite only loads .env on startup)');
+        }
     }
-    
+
     const response = await fetch(`${API_BASE_URL}/api/transaction`, {
         method: 'POST',
         headers,
